@@ -280,6 +280,44 @@ body {
   font-size: 0.9rem;
 }
 
+.timeline-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.shift-owner {
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.btn-edit {
+  padding: 6px 12px;
+  font-size: 0.85rem;
+}
+
+.badge-readonly {
+  background: #1c1917;
+  color: #a8a29e;
+  border: 1px dashed var(--line);
+}
+
+.field-static {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--line);
+}
+
+.field-static span {
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
 .timeline-empty {
   padding: 36px 20px;
   text-align: center;

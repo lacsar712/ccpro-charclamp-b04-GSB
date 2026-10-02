@@ -65,5 +65,9 @@ class BurnShift(Base):
     peak_temp_c: Mapped[float | None] = mapped_column(Float, nullable=True)
     charcoal_grade: Mapped[str] = mapped_column(String(40), nullable=False, default="B")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    # 乐观锁版本号：每次成功改写 +1，保存时按旧值比对，防止并发互相覆盖。
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
 
     clamp: Mapped[Clamp] = relationship(back_populates="shifts")
+    created_by: Mapped[User | None] = relationship()

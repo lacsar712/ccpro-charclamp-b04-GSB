@@ -34,6 +34,21 @@
       {% if shift.notes %}
       <p class="timeline-note">{{ shift.notes }}</p>
       {% endif %}
+      {% set s_perm = shift_perms.get(shift.id) if shift_perms is defined else none %}
+      <footer class="timeline-card-foot">
+        <span class="shift-owner">登记 {{ shift.created_by.username if shift.created_by else '—' }}</span>
+        {% if s_perm and s_perm.allowed %}
+        <button
+          type="button"
+          class="btn ghost btn-edit"
+          hx-get="/drawer/shift/{{ shift.id }}/edit"
+          hx-target="#drawer-root"
+          hx-swap="innerHTML"
+        >改写</button>
+        {% elif s_perm %}
+        <span class="badge badge-readonly" title="{{ s_perm.reason }}">只读</span>
+        {% endif %}
+      </footer>
     </article>
   </li>
   {% else %}

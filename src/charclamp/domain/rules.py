@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING
+
 from charclamp.domain.models import BurnShift, Clamp
+
+if TYPE_CHECKING:
+    from charclamp.domain.models import User
 
 MIN_PEAK_TEMP_FOR_DRAWN = 400.0
 
@@ -43,3 +50,72 @@ def assert_can_set_clamp_status(clamp: Clamp, new_status: str) -> None:
         ok, msg = can_mark_clamp_drawn(clamp)
         if not ok:
             raise RuleError(msg)
+
+
+# ---- 班次改写权限矩阵 ----
+
+ROLE_ADMIN = "admin"
+
+#: 班次可被改写的字段全集
+SHIFT_EDITABLE_FIELDS: tuple[str, ...] = ("notes", "peak_temp_c", "started_at", "charcoal_grade")
+#: 操作工可改写的字段（仅备注）
+SHIFT_WORKER_FIELDS: tuple[str, ...] = ("notes",)
+
+SHIFT_FIELD_LABELS = {
+    "notes": "备注",
+    "peak_temp_c": "峰值温度",
+    "started_at": "开始时刻",
+    "charcoal_grade": "炭品等级",
+}
+
+
+@dataclass(frozen=True)
+class ShiftEditPerm:
+    """单个用户对某条班次的改写权限结论（抽屉渲染与后台保存共用）。"""
+
+    allowed: bool
+    reason: str = ""
+    fields: frozenset[str] = frozenset()
+
+    def can_edit(self, field: str) -> bool:
+        return field in self.fields
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def is_shift_today(shift: BurnShift, now: datetime | None = None) -> bool:
+    """班次是否属于「当天」（按 UTC 日历日判定，与模型 utcnow 一致）。"""
+    now = now or datetime.now(timezone.utc)
+    return _as_utc(shift.started_at).date() == _as_utc(now).date()
+
+
+def shift_edit_perm(
+    user: User,
+    shift: BurnShift,
+    clamp: Clamp,
+    now: datetime | None = None,
+) -> ShiftEditPerm:
+    """
+    班次改写权限矩阵：
+    - 已出炭窑上的班次：全员只读（含管理员）；
+    - 管理员：可改备注、峰值温度、开始时刻、炭品等级；
+    - 操作工：仅可改「本人当天」班次的备注。
+    """
+    if clamp.status == Clamp.STATUS_DRAWN:
+        return ShiftEditPerm(False, "该窑已出炭，窑上班次全员只读", frozenset())
+    if user.role == ROLE_ADMIN:
+        return ShiftEditPerm(True, "", frozenset(SHIFT_EDITABLE_FIELDS))
+    if shift.created_by_id != user.id:
+        return ShiftEditPerm(False, "只能改写本人登记的班次", frozenset())
+    if not is_shift_today(shift, now):
+        return ShiftEditPerm(False, "只能改写当天班次", frozenset())
+    return ShiftEditPerm(True, "", frozenset(SHIFT_WORKER_FIELDS))
+
+
+def forbidden_shift_changes(perm: ShiftEditPerm, changed_fields: list[str]) -> list[str]:
+    """从实际发生变化的字段中，挑出当前权限不允许改写的字段。"""
+    return [field for field in changed_fields if not perm.can_edit(field)]

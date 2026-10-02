@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from litestar import Controller, MediaType, Request, get, post
@@ -9,9 +9,25 @@ from litestar.params import Body
 from litestar.response import Redirect, Template
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.exc import StaleDataError
 
 from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.rules import (
+    ADMIN_ONLY_FIELDS,
+    APP_TZ,
+    FIELD_CHARCOAL_GRADE,
+    FIELD_NOTES,
+    FIELD_PEAK_TEMP_C,
+    FIELD_STARTED_AT,
+    RuleError,
+    ShiftEditDenied,
+    ShiftEditPolicy,
+    assert_can_set_clamp_status,
+    assert_submitted_fields_allowed,
+    can_mark_clamp_drawn,
+    is_shift_today,
+    shift_edit_policy,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -45,6 +61,43 @@ def _parse_optional_int(raw: str | None) -> int | None:
         return int(raw)
     except (TypeError, ValueError):
         return None
+
+
+async def _load_shift_with_clamp(db, shift_id: int) -> tuple[BurnShift | None, Clamp | None]:
+    result = await db.execute(
+        select(BurnShift)
+        .where(BurnShift.id == shift_id)
+        .options(
+            selectinload(BurnShift.clamp).selectinload(Clamp.site),
+            selectinload(BurnShift.created_by),
+        )
+    )
+    shift = result.scalar_one_or_none()
+    return shift, (shift.clamp if shift else None)
+
+
+def _shift_drawer_context(
+    shift: BurnShift, clamp: Clamp, user: User, policy: ShiftEditPolicy
+) -> dict[str, Any]:
+    """抽屉（GET）与保存失败后回显共用同一份渲染结论。"""
+    local_started = shift.started_at
+    if local_started.tzinfo is None:
+        local_started = local_started.replace(tzinfo=timezone.utc)
+    local_started = local_started.astimezone(APP_TZ)
+    # datetime-local 输入框格式（不含时区）。
+    started_value = local_started.strftime("%Y-%m-%dT%H:%M")
+    return {
+        "shift": shift,
+        "clamp": clamp,
+        "status_labels": STATUS_LABELS,
+        "user": user,
+        "policy": policy,
+        "started_value": started_value,
+        "peak_value": "" if shift.peak_temp_c is None else shift.peak_temp_c,
+        "grade_value": shift.charcoal_grade,
+        "notes_value": shift.notes,
+        "is_today": is_shift_today(shift),
+    }
 
 
 async def _load_timeline_context(clamp_id: int | None = None) -> dict[str, Any]:
@@ -189,6 +242,18 @@ class TimelineController(Controller):
             },
         )
 
+    @get("/drawer/shift/{shift_id:int}", media_type=MediaType.HTML)
+    async def drawer_shift_edit(self, request: Request, shift_id: int) -> Template | Redirect:
+        if not request.user:
+            return Redirect("/login")
+        async with SessionLocal() as db:
+            shift, clamp = await _load_shift_with_clamp(db, shift_id)
+            if shift is None or clamp is None:
+                return Redirect("/")
+            policy = shift_edit_policy(shift, clamp, request.user)
+            ctx = _shift_drawer_context(shift, clamp, request.user, policy)
+        return Template(template_name="partials/drawer_shift_edit.html", context=ctx)
+
 
 class ShiftController(Controller):
     path = "/shifts"
@@ -214,6 +279,7 @@ class ShiftController(Controller):
                 peak_temp_c=peak,
                 charcoal_grade=(data.get("charcoal_grade") or "B").strip(),
                 notes=(data.get("notes") or "").strip(),
+                created_by_id=request.user.id,
             )
             db.add(shift)
             clamp = (
@@ -224,6 +290,111 @@ class ShiftController(Controller):
             await db.commit()
         _set_flash(request, "焖烧班次已登记", "ok")
         return Redirect(f"/?clamp_id={clamp_id}")
+
+    @post("/{shift_id:int}/edit")
+    async def edit_shift(
+        self,
+        request: Request,
+        shift_id: int,
+        data: dict[str, Any] = Body(media_type=RequestEncodingType.URL_ENCODED),
+    ) -> Template | Redirect:
+        """
+        班次改写保存——与编辑抽屉共用 shift_edit_policy 同一份结论：
+        藏起输入框不影响服务端判定；越权字段直 POST 一律 403；
+        version_id 乐观锁保证两名操作工并发改写只成一笔（后者 409）。
+        """
+        if not request.user:
+            return Redirect("/login")
+
+        def _render(
+            shift: BurnShift,
+            clamp: Clamp,
+            policy: ShiftEditPolicy,
+            error: str,
+            status_code: int,
+            values: dict[str, Any] | None = None,
+        ) -> Template:
+            ctx = _shift_drawer_context(shift, clamp, request.user, policy)
+            ctx["error"] = error
+            if values is not None:
+                ctx.update(values)
+            return Template(
+                template_name="partials/drawer_shift_edit.html",
+                context=ctx,
+                status_code=status_code,
+            )
+
+        async with SessionLocal() as db:
+            shift, clamp = await _load_shift_with_clamp(db, shift_id)
+            if shift is None or clamp is None:
+                return Redirect("/")
+
+            policy = shift_edit_policy(shift, clamp, request.user)
+
+            # 表单里实际提交了哪些业务字段（disabled 输入框不会提交，直 POST 会）。
+            submitted = {key for key in data.keys() if key in ADMIN_ONLY_FIELDS or key == FIELD_NOTES}
+            try:
+                assert_submitted_fields_allowed(policy, submitted)
+            except ShiftEditDenied as exc:
+                return _render(shift, clamp, policy, str(exc), 403)
+
+            # 乐观锁版本号：抽屉里隐藏域带出，落库时 ORM 还会再用 WHERE version_id 兜底。
+            expected_version = _parse_optional_int(data.get("version_id"))
+            if expected_version is None or expected_version != shift.version_id:
+                return _render(
+                    shift,
+                    clamp,
+                    policy,
+                    "该班次刚被别人改写过，请刷新后重试（并发改写仅一笔生效）。",
+                    409,
+                )
+
+            form_values = {
+                "started_value": data.get(FIELD_STARTED_AT, "") or "",
+                "peak_value": data.get(FIELD_PEAK_TEMP_C, "") or "",
+                "grade_value": data.get(FIELD_CHARCOAL_GRADE, "") or "",
+                "notes_value": (data.get(FIELD_NOTES) or ""),
+            }
+
+            try:
+                if FIELD_NOTES in submitted:
+                    shift.notes = (data.get(FIELD_NOTES) or "").strip()
+                if FIELD_STARTED_AT in submitted:
+                    raw_started = (data.get(FIELD_STARTED_AT) or "").strip()
+                    if not raw_started:
+                        raise ValueError("开始时刻不能为空")
+                    # datetime-local 为窑场本地时间，统一转 UTC 存储。
+                    naive = datetime.strptime(raw_started, "%Y-%m-%dT%H:%M")
+                    shift.started_at = naive.replace(tzinfo=APP_TZ).astimezone(timezone.utc)
+                if FIELD_PEAK_TEMP_C in submitted:
+                    raw_peak = (data.get(FIELD_PEAK_TEMP_C) or "").strip()
+                    shift.peak_temp_c = float(raw_peak) if raw_peak else None
+                if FIELD_CHARCOAL_GRADE in submitted:
+                    grade = (data.get(FIELD_CHARCOAL_GRADE) or "").strip()
+                    if not grade:
+                        raise ValueError("炭品等级不能为空")
+                    shift.charcoal_grade = grade
+            except (TypeError, ValueError):
+                return _render(shift, clamp, policy, "提交的数据格式有误，未保存。", 400, form_values)
+
+            try:
+                await db.commit()
+            except StaleDataError:
+                await db.rollback()
+                fresh_shift, fresh_clamp = await _load_shift_with_clamp(db, shift_id)
+                if fresh_shift is None or fresh_clamp is None:
+                    return Redirect("/")
+                fresh_policy = shift_edit_policy(fresh_shift, fresh_clamp, request.user)
+                return _render(
+                    fresh_shift,
+                    fresh_clamp,
+                    fresh_policy,
+                    "该班次刚被别人改写过，请刷新后重试（并发改写仅一笔生效）。",
+                    409,
+                )
+
+        _set_flash(request, "班次改写已保存", "ok")
+        return Redirect(f"/?clamp_id={clamp.id}")
 
 
 class ClampController(Controller):

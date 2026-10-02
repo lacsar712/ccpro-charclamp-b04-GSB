@@ -34,6 +34,15 @@
       {% if shift.notes %}
       <p class="timeline-note">{{ shift.notes }}</p>
       {% endif %}
+      <footer class="timeline-card-foot">
+        <button
+          type="button"
+          class="link-quiet"
+          hx-get="/drawer/shift/{{ shift.id }}"
+          hx-target="#drawer-root"
+          hx-swap="innerHTML"
+        >改写班次</button>
+      </footer>
     </article>
   </li>
   {% else %}

@@ -280,6 +280,21 @@ body {
   font-size: 0.9rem;
 }
 
+.timeline-card-foot {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--line);
+  text-align: right;
+}
+
+.timeline-card-foot .link-quiet {
+  background: none;
+  border: 0;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
 .timeline-empty {
   padding: 36px 20px;
   text-align: center;

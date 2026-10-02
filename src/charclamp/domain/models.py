@@ -23,6 +23,14 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="worker")
 
 
+ROLE_ADMIN = "admin"
+ROLE_WORKER = "worker"
+
+
+def is_admin(user: User) -> bool:
+    return user.role == ROLE_ADMIN
+
+
 class Site(Base):
     __tablename__ = "sites"
 
@@ -66,4 +74,13 @@ class BurnShift(Base):
     charcoal_grade: Mapped[str] = mapped_column(String(40), nullable=False, default="B")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # 班次归属与并发控制：
+    # created_by_id 为空表示历史遗留数据（无人可按“自建”身份改写，仅管理员可处理）。
+    created_by_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
+    # SQLAlchemy 乐观锁：UPDATE 带 AND version_id = ?，并发改写只成一笔。
+    version_id: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    __mapper_args__ = {"version_id_col": version_id}
+
     clamp: Mapped[Clamp] = relationship(back_populates="shifts")
+    created_by: Mapped[User | None] = relationship()

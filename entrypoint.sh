@@ -25,10 +25,11 @@ else:
 PY
 
 python << 'PY'
-from charclamp.infra.db import sync_create_all
+from charclamp.infra.db import sync_create_all, sync_ensure_shift_columns
 from charclamp.infra.seed import seed_demo
 
 sync_create_all()
+sync_ensure_shift_columns()
 seed_demo()
 print("migrate/seed done")
 PY
